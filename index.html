@@ -168,9 +168,7 @@
 
       <div class="mt-5 pt-4 border-t border-slate-100 text-center space-y-2">
         <div class="text-[11px] text-slate-400">الدخول محمي عبر خادم Firebase — مخصص للمستخدمين المصرّح لهم فقط.</div>
-        <button id="openFirstAdminSetupBtn" type="button" class="text-xs font-bold text-blue-600 hover:text-blue-800 hover:underline">
-          🛡️ تأسيس حساب الأدمن المحمي (لأول مرة فقط)
-        </button>
+
       </div>
     </div>
   </div>
@@ -1137,121 +1135,6 @@
     document.getElementById('loginForm').addEventListener('submit', (e) => {
       e.preventDefault();
       doLogin(document.getElementById('loginUsername').value, document.getElementById('loginPassword').value);
-    });
-
-    // First-Time Protected Admin Account Creation (Claims authorized_users once forever!)
-    document.getElementById('openFirstAdminSetupBtn').addEventListener('click', () => {
-      openFormModal('تأسيس حساب الأدمن المحمي (لأول مرة فقط)', `
-        <form id="firstAdminForm" class="space-y-3">
-          <div class="p-3 rounded-xl bg-blue-50 border border-blue-200 text-xs text-blue-900 leading-relaxed">
-            سيتم إنشاء حساب الأدمن الرسمي الخاص بك على خادم <strong>Firebase Authentication</strong> وقفل قاعدة البيانات باسمك بحيث لا يستطيع أي شخص آخر إنشاء حساب أو الوصول للبيانات إلا بإذنك من داخل تبويب الصلاحيات.
-          </div>
-          <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <div>
-              <label class="block text-xs font-bold text-slate-700 mb-1">اسمك الكامل *</label>
-              <input id="faName" type="text" required placeholder="مثال: م. بودي (الأدمن)" class="w-full px-3 py-2 rounded-xl border border-slate-200 text-sm" />
-            </div>
-            <div>
-              <label class="block text-xs font-bold text-slate-700 mb-1">اسم المستخدم (إنجليزي بدون مسافات) *</label>
-              <input id="faUser" type="text" required dir="ltr" placeholder="مثال: boudy أو admin" class="w-full px-3 py-2 rounded-xl border border-slate-200 text-sm font-mono" />
-            </div>
-            <div class="sm:col-span-2">
-              <label class="block text-xs font-bold text-slate-700 mb-1">كلمة المرور القوية (6 أحرف أو أرقام على الأقل) *</label>
-              <input id="faPass" type="password" required minlength="6" placeholder="••••••" class="w-full px-3 py-2 rounded-xl border border-slate-200 text-sm" />
-            </div>
-          </div>
-          <div id="faError" class="hidden text-xs text-red-600 bg-red-50 p-2.5 rounded-xl font-bold"></div>
-          <div class="flex justify-end gap-2 pt-2">
-            <button type="button" id="cancelFa" class="px-4 py-2 rounded-xl border border-slate-200 text-slate-600 text-xs font-bold">إلغاء</button>
-            <button type="submit" class="px-5 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold">تأسيس وقفل القاعدة الآن</button>
-          </div>
-        </form>
-      `);
-      document.getElementById('cancelFa').addEventListener('click', closeFormModal);
-      document.getElementById('firstAdminForm').addEventListener('submit', async (ev) => {
-        ev.preventDefault();
-        const errBox = document.getElementById('faError');
-        errBox.classList.add('hidden');
-        const name = document.getElementById('faName').value.trim();
-        const uname = document.getElementById('faUser').value.trim().toLowerCase().replace(/[^a-z0-9._-]/g, '');
-        const pass = document.getElementById('faPass').value;
-        if (!uname || pass.length < 6) {
-          errBox.textContent = 'اكتب اسم مستخدم بالإنجليزية وكلمة مرور 6 أحرف على الأقل.';
-          errBox.classList.remove('hidden');
-          return;
-        }
-        try {
-          const email = usernameToAuthEmail(uname);
-          // 1. Register or SignIn Admin on Firebase Auth
-          let authRes = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=${FIREBASE_API_KEY}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ email, password: pass, returnSecureToken: true })
-          });
-          let authData = await authRes.json();
-          if (!authRes.ok && authData.error && authData.error.message === 'EMAIL_EXISTS') {
-            authRes = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_API_KEY}`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ email, password: pass, returnSecureToken: true })
-            });
-            authData = await authRes.json();
-          }
-          if (!authRes.ok || !authData.idToken) {
-            errBox.textContent = 'تعذر التأسيس: تأكد من تفعيل Email/Password في Firebase Authentication.';
-            errBox.classList.remove('hidden');
-            return;
-          }
-
-          saveFbAuth({
-            idToken: authData.idToken,
-            refreshToken: authData.refreshToken,
-            uid: authData.localId,
-            email: authData.email,
-            expiresAt: Date.now() + (Number(authData.expiresIn) || 3600) * 1000
-          });
-
-          // 2. Claim Admin role in authorized_users (locked forever after first claim!)
-          const authzUrl = await fbDbUrl(`authorized_users/${authData.localId}`);
-          const claimRes = await fetch(authzUrl, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ role: 'admin', username: uname, name })
-          });
-          if (!claimRes.ok) {
-            saveFbAuth(null);
-            errBox.textContent = 'قاعدة البيانات مملوكة بالفعل لأدمن آخر (تم منع التأسيس المكرر بأمان).';
-            errBox.classList.remove('hidden');
-            return;
-          }
-
-          // 3. Replace demo users with real Admin account (no plaintext passwords saved in cloud!)
-          const adminUser = {
-            id: 'u_admin',
-            firebaseUid: authData.localId,
-            name,
-            username: uname,
-            password: '',
-            roleLabel: 'مدير المشروع (أدمن)',
-            permissions: {
-              canAdd: true, canEdit: true, canDelete: true,
-              canManageCustody: true, canViewReports: true, canManageSites: true, canManageUsers: true
-            }
-          };
-          state.users = [adminUser];
-          currentUser = adminUser;
-          saveSession(adminUser.id);
-          addAudit(`تأسيس حساب الأدمن المحمي (${name}) وقفل قاعدة البيانات`);
-          saveState(false);
-          closeFormModal();
-          showToast('تم تأسيس حساب الأدمن وقفل القاعدة بأمان 100% ✓');
-          startAutoSyncLoop();
-          renderApp();
-        } catch (err) {
-          errBox.textContent = 'تأكد من اتصالك بالإنترنت وحاول مرة أخرى.';
-          errBox.classList.remove('hidden');
-        }
-      });
     });
 
     function doLogout() {
