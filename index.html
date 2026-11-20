@@ -166,8 +166,11 @@
         <button type="submit" class="w-full py-3 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-bold text-sm shadow-lg shadow-blue-600/20 transition">تسجيل الدخول</button>
       </form>
 
-      <div class="mt-5 pt-4 border-t border-slate-100 text-center text-[11px] text-slate-400">
-        الدخول مخصص للمستخدمين المصرّح لهم فقط — يتم إنشاء الحسابات من قِبل الأدمن.
+      <div class="mt-5 pt-4 border-t border-slate-100 text-center space-y-2">
+        <div class="text-[11px] text-slate-400">الدخول محمي عبر خادم Firebase — مخصص للمستخدمين المصرّح لهم فقط.</div>
+        <button id="openFirstAdminSetupBtn" type="button" class="text-xs font-bold text-blue-600 hover:text-blue-800 hover:underline">
+          🛡️ تأسيس حساب الأدمن المحمي (لأول مرة فقط)
+        </button>
       </div>
     </div>
   </div>
@@ -266,6 +269,8 @@
     ========================================================================= */
     const STORAGE_KEY = 'shabakat_pro_data_v2';
     const DEFAULT_FIREBASE_URL = 'https://shabakat-c8171-default-rtdb.firebaseio.com';
+    const FIREBASE_API_KEY = 'AIzaSyC3YgO7ZtjrbMK4JPkTDR22tP-9G_mTKf8';
+    const AUTH_STORAGE_KEY = 'shabakat_fb_auth_v1';
     const SESSION_KEY = 'shabakat_pro_session_v1';
     const ADD_NEW_SITE_VAL = '__add_new_site__';
     const ADD_NEW_BAND_VAL = '__add_new_band__';
@@ -508,6 +513,59 @@
       return getDefaultData();
     }
 
+    let fbAuth = loadFbAuth();
+
+    function loadFbAuth() {
+      try {
+        const raw = localStorage.getItem(AUTH_STORAGE_KEY);
+        return raw ? JSON.parse(raw) : null;
+      } catch (e) { return null; }
+    }
+
+    function saveFbAuth(obj) {
+      fbAuth = obj;
+      try {
+        if (obj) localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(obj));
+        else localStorage.removeItem(AUTH_STORAGE_KEY);
+      } catch (e) {}
+    }
+
+    function usernameToAuthEmail(username) {
+      const clean = String(username || '').trim().toLowerCase();
+      if (clean.includes('@')) return clean;
+      return `${clean.replace(/[^a-z0-9._-]/g, '')}@shabakat.pro`;
+    }
+
+    async function ensureFreshAuthToken() {
+      if (!fbAuth || !fbAuth.idToken) return '';
+      if (fbAuth.expiresAt && Date.now() < fbAuth.expiresAt - 120000) {
+        return fbAuth.idToken;
+      }
+      if (!fbAuth.refreshToken || !navigator.onLine) return fbAuth.idToken;
+      try {
+        const res = await fetch(`https://securetoken.googleapis.com/v1/token?key=${FIREBASE_API_KEY}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: `grant_type=refresh_token&refresh_token=${encodeURIComponent(fbAuth.refreshToken)}`
+        });
+        if (res.ok) {
+          const data = await res.json();
+          fbAuth.idToken = data.id_token;
+          fbAuth.refreshToken = data.refresh_token || fbAuth.refreshToken;
+          fbAuth.expiresAt = Date.now() + (Number(data.expires_in) || 3600) * 1000;
+          saveFbAuth(fbAuth);
+          return fbAuth.idToken;
+        }
+      } catch (e) {}
+      return fbAuth.idToken;
+    }
+
+    async function fbDbUrl(nodePath) {
+      const base = (state.settings && state.settings.firebaseUrl || DEFAULT_FIREBASE_URL).trim().replace(/\/+$/, '');
+      const token = await ensureFreshAuthToken();
+      return token ? `${base}/${nodePath}.json?auth=${encodeURIComponent(token)}` : `${base}/${nodePath}.json`;
+    }
+
     let autoSyncTimer = null;
     let isCloudSyncing = false;
     let hasPendingCloudPush = false;
@@ -557,8 +615,17 @@
       isCloudSyncing = true;
       try {
         updateHeaderSyncBadge('جاري المزامنة...', 'syncing');
+        if (!fbAuth || !fbAuth.idToken) {
+          updateHeaderSyncBadge('سجل الدخول للمزامنة', 'idle');
+          return;
+        }
+        const dbEndpoint = await fbDbUrl('shabakat_data');
         // 1. Pull remote first and merge safely so two engineers never overwrite each other
-        const getRes = await fetch(`${url}/shabakat_data.json`);
+        const getRes = await fetch(dbEndpoint);
+        if (getRes.status === 401 || getRes.status === 403) {
+          updateHeaderSyncBadge('غير مصرح سحابياً', 'pending');
+          return;
+        }
         if (getRes.ok) {
           const remote = await getRes.json();
           if (remote && Array.isArray(remote.sites)) {
@@ -568,7 +635,7 @@
         // 2. Push merged state if local had changes
         if (pushLocal || hasPendingCloudPush) {
           state.settings.lastSyncAt = new Date().toLocaleString('ar-EG');
-          const putRes = await fetch(`${url}/shabakat_data.json`, {
+          const putRes = await fetch(dbEndpoint, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(state)
@@ -992,23 +1059,68 @@
     async function doLogin(username, password) {
       const errEl = document.getElementById('loginError');
       errEl.classList.add('hidden');
+      const uname = username.trim();
+      const email = usernameToAuthEmail(uname);
 
-      // Pull latest users & passwords from cloud before validating login if online
-      const url = (state.settings && state.settings.firebaseUrl || '').trim().replace(/\/+$/, '');
-      if (url && url.startsWith('https://') && navigator.onLine) {
+      // 1. Online Firebase Server Authentication (Primary Secure Path)
+      if (navigator.onLine && FIREBASE_API_KEY) {
         try {
-          const res = await fetch(`${url}/shabakat_data.json`);
-          if (res.ok) {
-            const remote = await res.json();
-            if (remote && Array.isArray(remote.users) && remote.users.length) {
-              state.users = remote.users;
-              mergeIncomingState(remote, true);
+          const authRes = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_API_KEY}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email, password, returnSecureToken: true })
+          });
+          const authData = await authRes.json();
+          if (authRes.ok && authData.idToken) {
+            saveFbAuth({
+              idToken: authData.idToken,
+              refreshToken: authData.refreshToken,
+              uid: authData.localId,
+              email: authData.email,
+              expiresAt: Date.now() + (Number(authData.expiresIn) || 3600) * 1000
+            });
+            // Verify user is in authorized_users by reading shabakat_data
+            const dbUrl = await fbDbUrl('shabakat_data');
+            const dbRes = await fetch(dbUrl);
+            if (dbRes.status === 401 || dbRes.status === 403) {
+              saveFbAuth(null);
+              errEl.textContent = 'هذا الحساب غير مصرح له بالدخول من قِبل الأدمن.';
+              errEl.classList.remove('hidden');
+              return;
+            }
+            if (dbRes.ok) {
+              const remote = await dbRes.json();
+              if (remote && Array.isArray(remote.users) && remote.users.length) {
+                state.users = remote.users;
+                mergeIncomingState(remote, true);
+              }
+            }
+            let matched = state.users.find(u => u.firebaseUid === authData.localId || u.username.toLowerCase() === uname.toLowerCase());
+            if (!matched) {
+              matched = state.users[0];
+            }
+            currentUser = matched;
+            saveSession(matched.id);
+            activeTab = 'dashboard';
+            document.getElementById('loginPassword').value = '';
+            showToast(`مرحباً بك، ${matched.name} — متصل سحابياً بأمان ✓`);
+            startAutoSyncLoop();
+            renderApp();
+            return;
+          } else {
+            // Fall through to offline check only if local user matches & offline; otherwise show auth error
+            const localMatch = state.users.find(u => u.username.toLowerCase() === uname.toLowerCase() && u.password && u.password === password);
+            if (!localMatch) {
+              errEl.textContent = 'اسم المستخدم أو كلمة المرور غير صحيحة (أو لم يتم تأسيس حساب الأدمن بعد).';
+              errEl.classList.remove('hidden');
+              return;
             }
           }
         } catch (e) {}
       }
 
-      const user = state.users.find(u => u.username.toLowerCase() === username.trim().toLowerCase() && u.password === password);
+      // 2. Offline Fallback (if already logged in before on this device)
+      const user = state.users.find(u => u.username.toLowerCase() === uname.toLowerCase() && u.password === password);
       if (!user) {
         errEl.textContent = 'اسم المستخدم أو كلمة المرور غير صحيحة.';
         errEl.classList.remove('hidden');
@@ -1018,7 +1130,7 @@
       saveSession(user.id);
       activeTab = 'dashboard';
       document.getElementById('loginPassword').value = '';
-      showToast(`مرحباً بك، ${user.name}`);
+      showToast(`مرحباً بك، ${user.name} (وضع أوفلاين)`);
       renderApp();
     }
 
@@ -1027,9 +1139,125 @@
       doLogin(document.getElementById('loginUsername').value, document.getElementById('loginPassword').value);
     });
 
+    // First-Time Protected Admin Account Creation (Claims authorized_users once forever!)
+    document.getElementById('openFirstAdminSetupBtn').addEventListener('click', () => {
+      openFormModal('تأسيس حساب الأدمن المحمي (لأول مرة فقط)', `
+        <form id="firstAdminForm" class="space-y-3">
+          <div class="p-3 rounded-xl bg-blue-50 border border-blue-200 text-xs text-blue-900 leading-relaxed">
+            سيتم إنشاء حساب الأدمن الرسمي الخاص بك على خادم <strong>Firebase Authentication</strong> وقفل قاعدة البيانات باسمك بحيث لا يستطيع أي شخص آخر إنشاء حساب أو الوصول للبيانات إلا بإذنك من داخل تبويب الصلاحيات.
+          </div>
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <label class="block text-xs font-bold text-slate-700 mb-1">اسمك الكامل *</label>
+              <input id="faName" type="text" required placeholder="مثال: م. بودي (الأدمن)" class="w-full px-3 py-2 rounded-xl border border-slate-200 text-sm" />
+            </div>
+            <div>
+              <label class="block text-xs font-bold text-slate-700 mb-1">اسم المستخدم (إنجليزي بدون مسافات) *</label>
+              <input id="faUser" type="text" required dir="ltr" placeholder="مثال: boudy أو admin" class="w-full px-3 py-2 rounded-xl border border-slate-200 text-sm font-mono" />
+            </div>
+            <div class="sm:col-span-2">
+              <label class="block text-xs font-bold text-slate-700 mb-1">كلمة المرور القوية (6 أحرف أو أرقام على الأقل) *</label>
+              <input id="faPass" type="password" required minlength="6" placeholder="••••••" class="w-full px-3 py-2 rounded-xl border border-slate-200 text-sm" />
+            </div>
+          </div>
+          <div id="faError" class="hidden text-xs text-red-600 bg-red-50 p-2.5 rounded-xl font-bold"></div>
+          <div class="flex justify-end gap-2 pt-2">
+            <button type="button" id="cancelFa" class="px-4 py-2 rounded-xl border border-slate-200 text-slate-600 text-xs font-bold">إلغاء</button>
+            <button type="submit" class="px-5 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold">تأسيس وقفل القاعدة الآن</button>
+          </div>
+        </form>
+      `);
+      document.getElementById('cancelFa').addEventListener('click', closeFormModal);
+      document.getElementById('firstAdminForm').addEventListener('submit', async (ev) => {
+        ev.preventDefault();
+        const errBox = document.getElementById('faError');
+        errBox.classList.add('hidden');
+        const name = document.getElementById('faName').value.trim();
+        const uname = document.getElementById('faUser').value.trim().toLowerCase().replace(/[^a-z0-9._-]/g, '');
+        const pass = document.getElementById('faPass').value;
+        if (!uname || pass.length < 6) {
+          errBox.textContent = 'اكتب اسم مستخدم بالإنجليزية وكلمة مرور 6 أحرف على الأقل.';
+          errBox.classList.remove('hidden');
+          return;
+        }
+        try {
+          const email = usernameToAuthEmail(uname);
+          // 1. Register or SignIn Admin on Firebase Auth
+          let authRes = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=${FIREBASE_API_KEY}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email, password: pass, returnSecureToken: true })
+          });
+          let authData = await authRes.json();
+          if (!authRes.ok && authData.error && authData.error.message === 'EMAIL_EXISTS') {
+            authRes = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_API_KEY}`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ email, password: pass, returnSecureToken: true })
+            });
+            authData = await authRes.json();
+          }
+          if (!authRes.ok || !authData.idToken) {
+            errBox.textContent = 'تعذر التأسيس: تأكد من تفعيل Email/Password في Firebase Authentication.';
+            errBox.classList.remove('hidden');
+            return;
+          }
+
+          saveFbAuth({
+            idToken: authData.idToken,
+            refreshToken: authData.refreshToken,
+            uid: authData.localId,
+            email: authData.email,
+            expiresAt: Date.now() + (Number(authData.expiresIn) || 3600) * 1000
+          });
+
+          // 2. Claim Admin role in authorized_users (locked forever after first claim!)
+          const authzUrl = await fbDbUrl(`authorized_users/${authData.localId}`);
+          const claimRes = await fetch(authzUrl, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ role: 'admin', username: uname, name })
+          });
+          if (!claimRes.ok) {
+            saveFbAuth(null);
+            errBox.textContent = 'قاعدة البيانات مملوكة بالفعل لأدمن آخر (تم منع التأسيس المكرر بأمان).';
+            errBox.classList.remove('hidden');
+            return;
+          }
+
+          // 3. Replace demo users with real Admin account (no plaintext passwords saved in cloud!)
+          const adminUser = {
+            id: 'u_admin',
+            firebaseUid: authData.localId,
+            name,
+            username: uname,
+            password: '',
+            roleLabel: 'مدير المشروع (أدمن)',
+            permissions: {
+              canAdd: true, canEdit: true, canDelete: true,
+              canManageCustody: true, canViewReports: true, canManageSites: true, canManageUsers: true
+            }
+          };
+          state.users = [adminUser];
+          currentUser = adminUser;
+          saveSession(adminUser.id);
+          addAudit(`تأسيس حساب الأدمن المحمي (${name}) وقفل قاعدة البيانات`);
+          saveState(false);
+          closeFormModal();
+          showToast('تم تأسيس حساب الأدمن وقفل القاعدة بأمان 100% ✓');
+          startAutoSyncLoop();
+          renderApp();
+        } catch (err) {
+          errBox.textContent = 'تأكد من اتصالك بالإنترنت وحاول مرة أخرى.';
+          errBox.classList.remove('hidden');
+        }
+      });
+    });
+
     function doLogout() {
       currentUser = null;
       saveSession(null);
+      saveFbAuth(null);
       renderApp();
     }
     document.getElementById('logoutBtnDesktop').addEventListener('click', doLogout);
@@ -4736,19 +4964,57 @@
           </form>
         `);
         document.getElementById('cancelUser').addEventListener('click', closeFormModal);
-        document.getElementById('userForm').addEventListener('submit', (e) => {
+        document.getElementById('userForm').addEventListener('submit', async (e) => {
           e.preventDefault();
-          const uname = document.getElementById('newUUsername').value.trim();
+          const uname = document.getElementById('newUUsername').value.trim().toLowerCase().replace(/[^a-z0-9._-]/g, '');
+          const upass = document.getElementById('newUPass').value;
+          const ufull = document.getElementById('newUName').value.trim();
+          const urole = document.getElementById('newURole').value.trim() || 'مهندس موقع';
+
+          if (!uname || upass.length < 6) {
+            showToast('اسم المستخدم بالإنجليزية وكلمة المرور 6 أحرف على الأقل', 'error');
+            return;
+          }
           if (state.users.some(x => x.username.toLowerCase() === uname.toLowerCase())) {
             showToast('اسم المستخدم موجود بالفعل، اختر اسماً آخر', 'error');
             return;
           }
+
+          let firebaseUid = '';
+          if (navigator.onLine && FIREBASE_API_KEY && fbAuth && fbAuth.idToken) {
+            try {
+              const email = usernameToAuthEmail(uname);
+              const regRes = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=${FIREBASE_API_KEY}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email, password: upass, returnSecureToken: true })
+              });
+              const regData = await regRes.json();
+              if (!regRes.ok || !regData.localId) {
+                showToast('تعذر تسجيل الحساب على Firebase (ربما الاسم مستخدم مسبقاً)', 'error');
+                return;
+              }
+              firebaseUid = regData.localId;
+              // Admin whitelists this new engineer in authorized_users!
+              const wlUrl = await fbDbUrl(`authorized_users/${firebaseUid}`);
+              await fetch(wlUrl, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ role: 'user', username: uname, name: ufull })
+              });
+            } catch (err) {
+              showToast('تأكد من الإنترنت لإنشاء حساب مهندس جديد على السحابة', 'error');
+              return;
+            }
+          }
+
           const newUser = {
             id: uid('u'),
-            name: document.getElementById('newUName').value.trim(),
-            roleLabel: document.getElementById('newURole').value.trim() || 'مهندس موقع',
+            firebaseUid,
+            name: ufull,
+            roleLabel: urole,
             username: uname,
-            password: document.getElementById('newUPass').value,
+            password: '',
             permissions: {
               canAdd: true,
               canEdit: false,
@@ -4760,10 +5026,10 @@
             }
           };
           state.users.push(newUser);
-          addAudit(`إنشاء حساب جديد للمستخدم ${newUser.name} (${newUser.username})`);
+          addAudit(`إنشاء وتوثيق حساب جديد للمهندس ${newUser.name} (${newUser.username})`);
           saveState();
           closeFormModal();
-          showToast('تم إنشاء الحساب بنجاح');
+          showToast('تم إنشاء الحساب وتوثيقه سحابياً بنجاح ✓');
           renderApp();
         });
       });
@@ -4835,11 +5101,17 @@
         btn.addEventListener('click', () => {
           const u = state.users.find(x => x.id === btn.dataset.delUser);
           if (!u) return;
-          openConfirm('حذف حساب مستخدم', `هل تريد حذف حساب "${u.name}"؟`, () => {
+          openConfirm('حذف حساب مستخدم', `هل تريد حذف حساب "${u.name}" وسحب صلاحيته من السحابة فوراً؟`, async () => {
+            if (u.firebaseUid && navigator.onLine && fbAuth && fbAuth.idToken) {
+              try {
+                const delUrl = await fbDbUrl(`authorized_users/${u.firebaseUid}`);
+                await fetch(delUrl, { method: 'DELETE' });
+              } catch (e) {}
+            }
             state.users = state.users.filter(x => x.id !== u.id);
-            addAudit(`حذف حساب المستخدم ${u.name}`);
+            addAudit(`حذف وسحب صلاحية المستخدم ${u.name}`);
             saveState();
-            showToast('تم حذف الحساب');
+            showToast('تم حذف الحساب وسحب صلاحيته من السحابة فوراً');
             renderApp();
           });
         });
@@ -5018,7 +5290,8 @@
         const url = (state.settings.firebaseUrl || '').trim();
         if (!url || !url.startsWith('https://')) { showToast('يرجى حفظ رابط Firebase يبدأ بـ https:// أولاً', 'error'); return; }
         try {
-          const res = await fetch(`${url}/shabakat_data.json`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(state) });
+          const authPushUrl = await fbDbUrl('shabakat_data');
+          const res = await fetch(authPushUrl, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(state) });
           if (!res.ok) throw new Error('HTTP ' + res.status);
           state.settings.lastSyncAt = new Date().toLocaleString('ar-EG');
           saveState();
@@ -5033,7 +5306,8 @@
         const url = (state.settings.firebaseUrl || '').trim();
         if (!url || !url.startsWith('https://')) { showToast('يرجى حفظ رابط Firebase يبدأ بـ https:// أولاً', 'error'); return; }
         try {
-          const res = await fetch(`${url}/shabakat_data.json`);
+          const authPullUrl = await fbDbUrl('shabakat_data');
+          const res = await fetch(authPullUrl);
           if (!res.ok) throw new Error('HTTP ' + res.status);
           const data = await res.json();
           if (data && mergeIncomingState(data)) {
